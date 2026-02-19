@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Tests
+tests/
+pytest_cache/
+.pytest_cache/
+
+# Docs
+*.md
+docs/
+
+# Local browser data (will be created at runtime)
+profileAnalyst/linkedin_browser_data/
+
+# Misc
+.DS_Store
+*.log
