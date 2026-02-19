@@ -40,8 +40,8 @@ RUN playwright install chromium
 # Copy application code
 COPY . .
 
-# Expose port (Render uses dynamic PORT)
-EXPOSE 8000
+# Expose port
+EXPOSE 8080
 
 # Start the application (use shell form to expand $PORT)
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}
