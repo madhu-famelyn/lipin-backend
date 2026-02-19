@@ -21,13 +21,6 @@ class ScrapeRequest(BaseModel):
 @router.post("/scrape")
 def scrape(req: ScrapeRequest):
     """Scrape a LinkedIn profile and return structured data."""
-    import os
-    # Scraping requires browser session - not available on cloud
-    if os.getenv("FLY_APP_NAME"):
-        raise HTTPException(
-            status_code=503,
-            detail="LinkedIn scraping is not available on cloud deployment. Please use the local scraper or contact support."
-        )
     try:
         data = scrape_profile(req.profile_url, headless=req.headless)
         if data:
@@ -49,12 +42,6 @@ def run_setup():
     Opens a headed browser — you must be running this locally.
     This runs in a background thread so the API doesn't block.
     """
-    import os
-    if os.getenv("FLY_APP_NAME"):
-        raise HTTPException(
-            status_code=503,
-            detail="Browser setup is not available on cloud deployment. Run locally: python scraper.py --setup"
-        )
     def _setup():
         setup_session()
 

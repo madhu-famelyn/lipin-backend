@@ -6,7 +6,11 @@ import argparse
 import os
 import datetime
 
-BROWSER_DATA_DIR = os.path.join(os.path.dirname(__file__), "linkedin_browser_data")
+# Use persistent volume on Fly.io, local directory otherwise
+if os.getenv("FLY_APP_NAME"):
+    BROWSER_DATA_DIR = "/data/linkedin_browser_data"
+else:
+    BROWSER_DATA_DIR = os.path.join(os.path.dirname(__file__), "linkedin_browser_data")
 
 date = datetime.datetime.now()
 BROWSER_ARGS = [

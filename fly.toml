@@ -18,3 +18,7 @@ primary_region = "sjc"
   memory = "1gb"
   cpu_kind = "shared"
   cpus = 1
+
+[mounts]
+  source = "linkedin_session"
+  destination = "/data/linkedin_browser_data"
