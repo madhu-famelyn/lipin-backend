@@ -332,14 +332,17 @@ def _extract_basic_info(page):
 
 
 def _extract_about(page):
-    """Extract the About section."""
+    """Extract the About section by finding header text."""
     try:
         about_text = page.evaluate("""
             () => {
+                // Find section containing "About" header text
                 const sections = document.querySelectorAll('main section');
                 for (const section of sections) {
                     const text = section.innerText || '';
-                    if (text.startsWith('About') || text.includes('\nAbout\n')) {
+                    // Check if this section starts with "About" as header
+                    if (text.startsWith('About') || text.includes('\\nAbout\\n')) {
+                        // Get all text content, excluding the header
                         const allText = [];
                         const walker = document.createTreeWalker(
                             section,
@@ -377,21 +380,23 @@ def _extract_about(page):
 
 
 def _extract_experience(page):
-    """Extract all experience entries."""
+    """Extract all experience entries by finding header text and using TreeWalker."""
     try:
         experiences = page.evaluate("""
             () => {
+                // Find section containing "Experience" header
                 const sections = document.querySelectorAll('main section');
                 let expSection = null;
                 for (const section of sections) {
                     const text = section.innerText || '';
-                    if (text.startsWith('Experience') || text.includes('\nExperience\n')) {
+                    if (text.startsWith('Experience') || text.includes('\\nExperience\\n')) {
                         expSection = section;
                         break;
                     }
                 }
                 if (!expSection) return [];
 
+                // Collect all text nodes from the experience section
                 const allText = [];
                 const walker = document.createTreeWalker(
                     expSection,
@@ -411,6 +416,7 @@ def _extract_experience(page):
                     }
                 }
 
+                // Parse text into experience entries
                 const results = [];
                 let currentEntry = null;
                 const seenEntries = new Set();
@@ -419,27 +425,32 @@ def _extract_experience(page):
                     const text = allText[i];
                     const nextText = allText[i + 1] || '';
 
+                    // Company pattern: contains · with employment type
                     const isCompany = text.includes('·') &&
                         (text.includes('Full-time') || text.includes('Part-time') ||
                          text.includes('Internship') || text.includes('Contract') ||
                          text.includes('Freelance') || text.includes('Self-employed'));
 
-                    const isDuration = /\d{4}/.test(text) &&
+                    // Duration pattern
+                    const isDuration = /\\d{4}/.test(text) &&
                         (text.includes(' - ') ||
                          text.toLowerCase().includes('present') ||
-                         /\d+\s*(yr|mo|year|month)/i.test(text));
+                         /\\d+\\s*(yr|mo|year|month)/i.test(text));
 
+                    // Location pattern
                     const isLocation = !isCompany && !isDuration &&
                         ((text.includes(',') && text.length < 60) ||
                          (text.toLowerCase().includes('remote') && text.length < 50) ||
                          (text.toLowerCase().includes('united states') && text.length < 80) ||
                          (text.toLowerCase().includes('india') && text.length < 50));
 
+                    // Skills pattern (skip)
                     const isSkills = text.toLowerCase().includes('skills') &&
                         (text.includes(':') || text.includes('+'));
 
+                    // Skip UI elements
                     if (text === '·' || text === '-' || text === '•' ||
-                        /^\d+$/.test(text) || text.length < 2 || isSkills) {
+                        /^\\d+$/.test(text) || text.length < 2 || isSkills) {
                         continue;
                     }
 
@@ -458,18 +469,23 @@ def _extract_experience(page):
                         continue;
                     }
 
+                    // Description: long text
                     if (text.length > 80 && !isDuration && !isCompany && currentEntry) {
                         currentEntry.description = text;
                         continue;
                     }
 
+                    // Job title: short text not matching other patterns
+                    // Next item should be company (contains employment type indicator)
                     if (text.length > 2 && text.length < 80 &&
                         !isDuration && !isLocation && !isCompany) {
+                        // Check if next looks like company
                         const nextIsCompany = nextText.includes('·') &&
                             (nextText.includes('Full-time') || nextText.includes('Part-time') ||
                              nextText.includes('Internship') || nextText.includes('Contract'));
 
                         if (nextIsCompany) {
+                            // Save previous entry
                             if (currentEntry && currentEntry.title && currentEntry.company) {
                                 const key = currentEntry.title + '|' + currentEntry.company;
                                 if (!seenEntries.has(key)) {
@@ -489,6 +505,7 @@ def _extract_experience(page):
                     }
                 }
 
+                // Save last entry
                 if (currentEntry && currentEntry.title && currentEntry.company) {
                     const key = currentEntry.title + '|' + currentEntry.company;
                     if (!seenEntries.has(key)) {
@@ -505,21 +522,23 @@ def _extract_experience(page):
 
 
 def _extract_education(page):
-    """Extract all education entries."""
+    """Extract all education entries by finding header text and using TreeWalker."""
     try:
         education = page.evaluate("""
             () => {
+                // Find section containing "Education" header
                 const sections = document.querySelectorAll('main section');
                 let eduSection = null;
                 for (const section of sections) {
                     const text = section.innerText || '';
-                    if (text.startsWith('Education') || text.includes('\nEducation\n')) {
+                    if (text.startsWith('Education') || text.includes('\\nEducation\\n')) {
                         eduSection = section;
                         break;
                     }
                 }
                 if (!eduSection) return [];
 
+                // Collect all text nodes from the education section
                 const allText = [];
                 const walker = document.createTreeWalker(
                     eduSection,
@@ -540,6 +559,7 @@ def _extract_education(page):
                     }
                 }
 
+                // Parse text into education entries
                 const results = [];
                 let currentEntry = null;
                 const seenSchools = new Set();
@@ -547,17 +567,20 @@ def _extract_education(page):
                 for (let i = 0; i < allText.length; i++) {
                     const text = allText[i];
 
-                    const isDate = /\d{4}\s*[-–]\s*\d{4}/.test(text) ||
-                        /\d{4}\s*[-–]\s*(Present|present)/.test(text) ||
-                        /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}/.test(text);
+                    // Date pattern: contains year range
+                    const isDate = /\\d{4}\\s*[-–]\\s*\\d{4}/.test(text) ||
+                        /\\d{4}\\s*[-–]\\s*(Present|present)/.test(text) ||
+                        /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\s+\\d{4}/.test(text);
 
-                    if (text.length < 2 || /^\d+$/.test(text)) continue;
+                    // Skip short meaningless text
+                    if (text.length < 2 || /^\\d+$/.test(text)) continue;
 
                     if (isDate && currentEntry) {
                         currentEntry.dates = text;
                         continue;
                     }
 
+                    // Degree patterns - check FIRST before school
                     const looksLikeDegree = text.length > 3 && text.length < 150 &&
                         (text.includes('Bachelor') || text.includes('Master') ||
                          text.includes("Master's") || text.includes("Bachelor's") ||
@@ -567,6 +590,7 @@ def _extract_education(page):
                          text.includes('Ph.D') || text.includes('MBA') ||
                          text.includes('degree'));
 
+                    // School names - must contain institution keyword
                     const looksLikeSchool = text.length > 5 && text.length < 150 &&
                         !looksLikeDegree &&
                         (text.toLowerCase().includes('university') ||
@@ -576,6 +600,7 @@ def _extract_education(page):
                          text.toLowerCase().includes('academy'));
 
                     if (looksLikeSchool) {
+                        // Save previous entry if valid
                         if (currentEntry && currentEntry.school && !seenSchools.has(currentEntry.school)) {
                             seenSchools.add(currentEntry.school);
                             results.push(currentEntry);
@@ -592,6 +617,7 @@ def _extract_education(page):
                     }
                 }
 
+                // Save last entry
                 if (currentEntry && currentEntry.school && !seenSchools.has(currentEntry.school)) {
                     results.push(currentEntry);
                 }
@@ -784,6 +810,7 @@ def _extract_recent_activity(page, profile_url):
         page.goto(activity_url, wait_until="domcontentloaded")
         _random_delay(2.0, 3.0)
 
+        # Scroll a bit to load some posts
         for _ in range(3):
             page.evaluate("window.scrollBy(0, 800)")
             time.sleep(random.uniform(0.5, 1.0))
@@ -794,6 +821,7 @@ def _extract_recent_activity(page, profile_url):
                 const main = document.querySelector('main');
                 if (!main) return [];
 
+                // Find all feed items (posts)
                 const feedItems = main.querySelectorAll('div[data-urn]');
                 const count = Math.min(feedItems.length, 5);
 
@@ -801,6 +829,7 @@ def _extract_recent_activity(page, profile_url):
                     const item = feedItems[i];
                     const post = { text: null, reactions: null, comments: null };
 
+                    // Get post text
                     const allText = [];
                     const walker = document.createTreeWalker(
                         item,
@@ -812,6 +841,7 @@ def _extract_recent_activity(page, profile_url):
                     let node;
                     while (node = walker.nextNode()) {
                         const text = node.textContent.trim();
+                        // Filter for actual post content
                         if (text.length > 30 && text.length < 3000 &&
                             !text.includes('Like') &&
                             !text.includes('Comment') &&
@@ -825,16 +855,19 @@ def _extract_recent_activity(page, profile_url):
                         post.text = allText.join(' ').substring(0, 1000);
                     }
 
+                    // Find reaction count (number followed by reaction indicators)
                     const allNums = item.querySelectorAll('span');
                     for (const span of allNums) {
                         const t = span.textContent.trim();
-                        if (/^\d+$/.test(t) || /^\d+,\d+$/.test(t)) {
+                        if (/^\\d+$/.test(t) || /^\\d+,\\d+$/.test(t)) {
                             if (!post.reactions) post.reactions = t;
                             else if (!post.comments) post.comments = t;
                         }
                     }
 
-                    if (post.text) results.push(post);
+                    if (post.text) {
+                        results.push(post);
+                    }
                 }
 
                 return results;
