@@ -1,6 +1,24 @@
+# Environment files
+.env
 *.env
-backend/.env
-echo "lipInBackEnd/*.json" >> .gitignore
-echo "**/*firebase-adminsdk*.json" >> .gitignore
+
+# Firebase credentials (NEVER commit these)
+firebase.json
+*firebase*.json
+*-firebase-adminsdk*.json
+**/*firebase-adminsdk*.json
+
+# Python
 __pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Playwright
 ms-playwright/
+linkedin_browser_data/
+
+# IDE
+.idea/
+.vscode/

@@ -5,14 +5,18 @@ import random
 import argparse
 import os
 import datetime
+import threading
 
 # Use persistent volume on Fly.io, local directory otherwise
 if os.getenv("FLY_APP_NAME"):
-    BROWSER_DATA_DIR = "/data/linkedin_browser_data"
+    SESSION_FILE = "/data/linkedin_session.json"
 else:
-    BROWSER_DATA_DIR = os.path.join(os.path.dirname(__file__), "linkedin_browser_data")
+    SESSION_FILE = os.path.join(os.path.dirname(__file__), "linkedin_session.json")
 
-date = datetime.datetime.now()
+# FIX #4: Cap concurrent browser instances to prevent OOM
+# Raise or lower depending on your server's RAM (3 is safe for ~1–2GB)
+_SCRAPE_SEMAPHORE = threading.Semaphore(3)
+
 BROWSER_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--no-sandbox",
@@ -171,16 +175,16 @@ def _extract_basic_info(page):
                     if (i > 0) {
                         const prevText = allText[i-1].text;
                         // Handle "500+" or pure numbers
-                        if (/^\\d+\\+?$/.test(prevText)) {
+                        if (/^\d+\+?$/.test(prevText)) {
                             result.connections = prevText;  // Keep as string like "500+"
-                        } else if (/^[\\d,]+$/.test(prevText)) {
+                        } else if (/^[\d,]+$/.test(prevText)) {
                             result.connections = parseInt(prevText.replace(/,/g, ''));
                         }
                     }
                 }
                 // Check for followers
                 if (text === 'followers' && result.followers === 0) {
-                    if (i > 0 && /^[\\d,]+$/.test(allText[i-1].text)) {
+                    if (i > 0 && /^[\d,]+$/.test(allText[i-1].text)) {
                         result.followers = parseInt(allText[i-1].text.replace(/,/g, ''));
                     }
                 }
@@ -189,7 +193,7 @@ def _extract_basic_info(page):
             // Fallback: look for "500+ connections" or "X connections" in full text
             if (!result.connections) {
                 const fullText = document.body.innerText;
-                const connMatch = fullText.match(/(\\d[\\d,]*\\+?)\\s*connections?/i);
+                const connMatch = fullText.match(/(\d[\d,]*\+?)\s*connections?/i);
                 if (connMatch) {
                     const val = connMatch[1].replace(/,/g, '');
                     result.connections = val.includes('+') ? val : parseInt(val);
@@ -199,7 +203,7 @@ def _extract_basic_info(page):
             // Also look for "X followers" pattern in full text
             if (result.followers === 0) {
                 const fullText = document.body.innerText;
-                const followersMatch = fullText.match(/(\\d[\\d,]*)\\s*followers?/i);
+                const followersMatch = fullText.match(/(\d[\d,]*)\s*followers?/i);
                 if (followersMatch) {
                     result.followers = parseInt(followersMatch[1].replace(/,/g, ''));
                 }
@@ -273,7 +277,7 @@ def _extract_about(page):
                 for (const section of sections) {
                     const text = section.innerText || '';
                     // Check if this section starts with "About" as header
-                    if (text.startsWith('About') || text.includes('\\nAbout\\n')) {
+                    if (text.startsWith('About') || text.includes('\nAbout\n')) {
                         // Get all text content, excluding the header
                         const allText = [];
                         const walker = document.createTreeWalker(
@@ -321,7 +325,7 @@ def _extract_experience(page):
                 let expSection = null;
                 for (const section of sections) {
                     const text = section.innerText || '';
-                    if (text.startsWith('Experience') || text.includes('\\nExperience\\n')) {
+                    if (text.startsWith('Experience') || text.includes('\nExperience\n')) {
                         expSection = section;
                         break;
                     }
@@ -364,10 +368,10 @@ def _extract_experience(page):
                          text.includes('Freelance') || text.includes('Self-employed'));
 
                     // Duration pattern
-                    const isDuration = /\\d{4}/.test(text) &&
+                    const isDuration = /\d{4}/.test(text) &&
                         (text.includes(' - ') ||
                          text.toLowerCase().includes('present') ||
-                         /\\d+\\s*(yr|mo|year|month)/i.test(text));
+                         /\d+\s*(yr|mo|year|month)/i.test(text));
 
                     // Location pattern
                     const isLocation = !isCompany && !isDuration &&
@@ -382,7 +386,7 @@ def _extract_experience(page):
 
                     // Skip UI elements
                     if (text === '·' || text === '-' || text === '•' ||
-                        /^\\d+$/.test(text) || text.length < 2 || isSkills) {
+                        /^\d+$/.test(text) || text.length < 2 || isSkills) {
                         continue;
                     }
 
@@ -463,7 +467,7 @@ def _extract_education(page):
                 let eduSection = null;
                 for (const section of sections) {
                     const text = section.innerText || '';
-                    if (text.startsWith('Education') || text.includes('\\nEducation\\n')) {
+                    if (text.startsWith('Education') || text.includes('\nEducation\n')) {
                         eduSection = section;
                         break;
                     }
@@ -500,12 +504,12 @@ def _extract_education(page):
                     const text = allText[i];
 
                     // Date pattern: contains year range
-                    const isDate = /\\d{4}\\s*[-–]\\s*\\d{4}/.test(text) ||
-                        /\\d{4}\\s*[-–]\\s*(Present|present)/.test(text) ||
-                        /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\s+\\d{4}/.test(text);
+                    const isDate = /\d{4}\s*[-–]\s*\d{4}/.test(text) ||
+                        /\d{4}\s*[-–]\s*(Present|present)/.test(text) ||
+                        /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}/.test(text);
 
                     // Skip short meaningless text
-                    if (text.length < 2 || /^\\d+$/.test(text)) continue;
+                    if (text.length < 2 || /^\d+$/.test(text)) continue;
 
                     if (isDate && currentEntry) {
                         currentEntry.dates = text;
@@ -627,8 +631,8 @@ def _extract_skills(page, profile_url):
 
                     // Skip numbers, very short text, or long text
                     if (text.length < 2 || text.length > 60) continue;
-                    if (/^\\d+$/.test(text)) continue;
-                    if (/^\\d+\\s*(endorsement|connection|skill)/i.test(text)) continue;
+                    if (/^\d+$/.test(text)) continue;
+                    if (/^\d+\s*(endorsement|connection|skill)/i.test(text)) continue;
 
                     // Skip UI elements and company names in endorsements
                     if (text.includes('·') || text === '-') continue;
@@ -714,7 +718,7 @@ def _extract_certifications(page, profile_url):
 
                     // Skip UI elements
                     if (skipTexts.has(lower) || text.length < 2) continue;
-                    if (text === '·' || text === '-' || /^\\d+$/.test(text)) continue;
+                    if (text === '·' || text === '-' || /^\d+$/.test(text)) continue;
                     if (text.startsWith('Credential ID')) continue;
                     if (text.endsWith('.pdf')) continue;
 
@@ -830,7 +834,7 @@ def _extract_recent_activity(page, profile_url):
                     const allNums = item.querySelectorAll('span');
                     for (const span of allNums) {
                         const t = span.textContent.trim();
-                        if (/^\\d+$/.test(t) || /^\\d+,\\d+$/.test(t)) {
+                        if (/^\d+$/.test(t) || /^\d+,\d+$/.test(t)) {
                             if (!post.reactions) post.reactions = t;
                             else if (!post.comments) post.comments = t;
                         }
@@ -854,17 +858,22 @@ def _extract_recent_activity(page, profile_url):
 # ──────────────────────────────────────────────
 
 def setup_session():
-    """One-time setup: opens a browser for manual login. Session is persisted."""
+    """
+    One-time setup: opens a browser for manual login.
+    FIX #2: Saves session as a small JSON file (cookies only) instead of
+    a full persistent browser profile directory. This avoids the file lock
+    that causes concurrent requests to fail, and stops disk space growing.
+    """
     with sync_playwright() as p:
-        launch_options = {
-            "user_data_dir": BROWSER_DATA_DIR,
-            "headless": False,
-            "args": BROWSER_ARGS,
-            "viewport": VIEWPORT,
-            "user_agent": USER_AGENT,
-        }
-        browser = p.chromium.launch_persistent_context(**launch_options)
-        page = browser.new_page()
+        browser = p.chromium.launch(
+            headless=False,
+            args=BROWSER_ARGS,
+        )
+        context = browser.new_context(
+            user_agent=USER_AGENT,
+            viewport=VIEWPORT,
+        )
+        page = context.new_page()
         page.goto("https://www.linkedin.com/login")
 
         print("=" * 50)
@@ -874,8 +883,11 @@ def setup_session():
         print("=" * 50)
         input()
 
+        # Save ONLY cookies + localStorage as a small ~5KB JSON file.
+        # No bloated profile directory, no OS-level lock.
+        context.storage_state(path=SESSION_FILE)
         browser.close()
-        print("Session saved to:", BROWSER_DATA_DIR)
+        print("Session saved to:", SESSION_FILE)
 
 
 def scrape_profile(profile_url: str, headless: bool = True) -> dict:
@@ -894,85 +906,98 @@ def scrape_profile(profile_url: str, headless: bool = True) -> dict:
     if not profile_url.startswith("https://"):
         profile_url = "https://" + profile_url
 
+    if not os.path.exists(SESSION_FILE):
+        raise RuntimeError(
+            f"No session file found at {SESSION_FILE}. "
+            "Run: python scraper.py --setup"
+        )
+
     result = {"profile_url": profile_url}
 
-    with sync_playwright() as p:
-        launch_options = {
-            "user_data_dir": BROWSER_DATA_DIR,
-            "headless": headless,
-            "args": BROWSER_ARGS,
-            "viewport": VIEWPORT,
-            "user_agent": USER_AGENT,
-        }
-        browser = p.chromium.launch_persistent_context(**launch_options)
-
-        page = browser.new_page()
-
-        try:
-            # Navigate to profile
-            page.goto(profile_url, wait_until="domcontentloaded")
-
-            # Wait for page to fully load and render
-            page.wait_for_load_state("load")
-            _random_delay(2.0, 3.5)
-
-            # Scroll to trigger lazy loading of content
-            page.evaluate("window.scrollTo(0, 500)")
-            _random_delay(1.5, 2.5)
-            page.evaluate("window.scrollTo(0, 0)")
-            _random_delay(1.0, 2.0)
-
-            # Check for login redirect or authwall
-            page_url = page.url.lower()
-            if any(x in page_url for x in ["/login", "/authwall", "/signup", "/checkpoint"]):
-                browser.close()
-                raise RuntimeError(
-                    "Session expired or not set up. Run: python scraper.py --setup"
-                )
-
-            # Double-check: if h1 says "Join LinkedIn" or "Sign in", we're on authwall
+    # FIX #4: Acquire semaphore slot before launching browser.
+    # At most 3 browsers run simultaneously regardless of API concurrency.
+    with _SCRAPE_SEMAPHORE:
+        with sync_playwright() as p:
+            # FIX #2: Use launch() + storage_state instead of
+            # launch_persistent_context(). No folder lock — multiple
+            # requests can run truly in parallel.
+            browser = p.chromium.launch(headless=headless, args=BROWSER_ARGS)
+            context = None
             try:
-                h1_text = page.locator("h1").first.inner_text(timeout=3000).strip()
-                if h1_text.lower() in ("join linkedin", "sign in", "sign up"):
-                    browser.close()
+                context = browser.new_context(
+                    storage_state=SESSION_FILE,
+                    user_agent=USER_AGENT,
+                    viewport=VIEWPORT,
+                )
+                page = context.new_page()
+
+                # FIX: Hard cap — no single page action hangs forever
+                page.set_default_timeout(30_000)  # 30 seconds
+
+                # Navigate to profile
+                page.goto(profile_url, wait_until="domcontentloaded")
+                page.wait_for_load_state("load")
+                _random_delay(2.0, 3.5)
+
+                # Scroll to trigger lazy loading of content
+                page.evaluate("window.scrollTo(0, 500)")
+                _random_delay(1.5, 2.5)
+                page.evaluate("window.scrollTo(0, 0)")
+                _random_delay(1.0, 2.0)
+
+                # FIX #1: Only raise here — do NOT call browser.close() inside try.
+                # The finally block always handles cleanup, even on this path.
+                page_url = page.url.lower()
+                if any(x in page_url for x in ["/login", "/authwall", "/signup", "/checkpoint"]):
                     raise RuntimeError(
-                        "Session expired or not set up. Run: python scraper.py --setup"
+                        "SESSION_EXPIRED: Run python scraper.py --setup to refresh."
                     )
-            except RuntimeError:
-                raise
-            except Exception:
-                pass
 
-            print("Extracting basic info...")
-            result["basic_info"] = _extract_basic_info(page)
+                # Double-check: if h1 says "Join LinkedIn" or "Sign in", we're on authwall
+                try:
+                    h1_text = page.locator("h1").first.inner_text(timeout=3000).strip()
+                    if h1_text.lower() in ("join linkedin", "sign in", "sign up"):
+                        raise RuntimeError(
+                            "SESSION_EXPIRED: Run python scraper.py --setup to refresh."
+                        )
+                except RuntimeError:
+                    raise
+                except Exception:
+                    pass
 
-            print("Extracting about...")
-            result["about"] = _extract_about(page)
+                print("Extracting basic info...")
+                result["basic_info"] = _extract_basic_info(page)
 
-            print("Extracting experience...")
-            result["experience"] = _extract_experience(page)
+                print("Extracting about...")
+                result["about"] = _extract_about(page)
 
-            print("Extracting education...")
-            result["education"] = _extract_education(page)
+                print("Extracting experience...")
+                result["experience"] = _extract_experience(page)
 
-            print("Extracting skills...")
-            result["skills"] = _extract_skills(page, profile_url)
+                print("Extracting education...")
+                result["education"] = _extract_education(page)
 
-            # Certifications and posts are kept commented - uncomment when needed
-            _random_delay(1.0, 2.0)
-            print("Extracting certifications...")
-            result["certifications"] = _extract_certifications(page, profile_url)
+                print("Extracting skills...")
+                result["skills"] = _extract_skills(page, profile_url)
 
-            # _random_delay(1.0, 2.0)
-            print("Extracting recent posts...")
-            result["recent_posts"] = _extract_recent_activity(page, profile_url)
+                _random_delay(1.0, 2.0)
+                print("Extracting certifications...")
+                result["certifications"] = _extract_certifications(page, profile_url)
 
-            scraped_date_str = date.strftime("%Y-%m-%d %H:%M:%S")
-            print('Scraped Date:', scraped_date_str)
-            result['scraped_date'] = scraped_date_str
+                print("Extracting recent posts...")
+                result["recent_posts"] = _extract_recent_activity(page, profile_url)
 
-        finally:
-            browser.close()
+                # FIX #3: datetime.now() called HERE, not at module import time.
+                # Previously `date` was set once when the process started,
+                # so every record got the same wrong timestamp.
+                result["scraped_date"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            finally:
+                # FIX #1: Always runs — cleans up even on session expiry,
+                # exceptions, or timeouts. No more zombie browser processes.
+                if context:
+                    context.close()
+                browser.close()
 
     return result
 
