@@ -379,9 +379,52 @@ def _extract_about(page):
         return None
 
 
+def _scroll_to_section(page, section_name):
+    """Scroll to a specific section by its header text."""
+    try:
+        page.evaluate(f"""
+            () => {{
+                const sections = document.querySelectorAll('main section');
+                for (const section of sections) {{
+                    const text = section.innerText || '';
+                    if (text.startsWith('{section_name}') || text.includes('\\n{section_name}\\n')) {{
+                        section.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+                        return true;
+                    }}
+                }}
+                return false;
+            }}
+        """)
+        time.sleep(1.5)
+    except Exception:
+        pass
+
+
+def _click_show_all_buttons(page):
+    """Click all 'Show all' buttons to expand sections."""
+    try:
+        page.evaluate("""
+            () => {
+                const buttons = document.querySelectorAll('button, a');
+                for (const btn of buttons) {
+                    const text = (btn.textContent || '').toLowerCase();
+                    if (text.includes('show all') && !text.includes('show all ')) {
+                        btn.click();
+                    }
+                }
+            }
+        """)
+        time.sleep(1.0)
+    except Exception:
+        pass
+
+
 def _extract_experience(page):
     """Extract all experience entries by finding header text and using TreeWalker."""
     try:
+        # Scroll to experience section and wait for load
+        _scroll_to_section(page, "Experience")
+
         experiences = page.evaluate("""
             () => {
                 // Find section containing "Experience" header
@@ -476,19 +519,34 @@ def _extract_experience(page):
                     }
 
                     // Job title: short text not matching other patterns
-                    // Next item should be company (contains employment type indicator)
                     if (text.length > 2 && text.length < 80 &&
                         !isDuration && !isLocation && !isCompany) {
-                        // Check if next looks like company
+                        // Check if next looks like company OR duration (more flexible)
                         const nextIsCompany = nextText.includes('·') &&
                             (nextText.includes('Full-time') || nextText.includes('Part-time') ||
-                             nextText.includes('Internship') || nextText.includes('Contract'));
+                             nextText.includes('Internship') || nextText.includes('Contract') ||
+                             nextText.includes('Freelance') || nextText.includes('Self-employed'));
 
-                        if (nextIsCompany) {
+                        // Also match if next text looks like a company name (contains org indicators)
+                        const nextLooksLikeOrg = nextText.length > 3 && nextText.length < 100 &&
+                            !nextText.includes('·') &&
+                            (nextText.toLowerCase().includes('inc') ||
+                             nextText.toLowerCase().includes('llc') ||
+                             nextText.toLowerCase().includes('ltd') ||
+                             nextText.toLowerCase().includes('corp') ||
+                             nextText.toLowerCase().includes('company') ||
+                             nextText.toLowerCase().includes('technologies') ||
+                             nextText.toLowerCase().includes('solutions') ||
+                             nextText.toLowerCase().includes('services') ||
+                             nextText.toLowerCase().includes('group') ||
+                             nextText.toLowerCase().includes('financial') ||
+                             /^[A-Z]/.test(nextText));
+
+                        if (nextIsCompany || nextLooksLikeOrg) {
                             // Save previous entry
-                            if (currentEntry && currentEntry.title && currentEntry.company) {
-                                const key = currentEntry.title + '|' + currentEntry.company;
-                                if (!seenEntries.has(key)) {
+                            if (currentEntry && currentEntry.title) {
+                                const key = currentEntry.title + '|' + (currentEntry.company || '');
+                                if (!seenEntries.has(key) && currentEntry.company) {
                                     seenEntries.add(key);
                                     results.push(currentEntry);
                                 }
@@ -501,6 +559,23 @@ def _extract_experience(page):
                                 location: null,
                                 description: null
                             };
+                        }
+                    }
+
+                    // If we have a current entry without company and this looks like a company
+                    if (currentEntry && !currentEntry.company && !isCompany && !isDuration && !isLocation) {
+                        const looksLikeCompany = text.length > 2 && text.length < 100 &&
+                            (text.toLowerCase().includes('inc') ||
+                             text.toLowerCase().includes('llc') ||
+                             text.toLowerCase().includes('ltd') ||
+                             text.toLowerCase().includes('corp') ||
+                             text.toLowerCase().includes('company') ||
+                             text.toLowerCase().includes('technologies') ||
+                             text.toLowerCase().includes('solutions') ||
+                             text.toLowerCase().includes('financial') ||
+                             /^[A-Z][a-z]+ [A-Z]/.test(text));
+                        if (looksLikeCompany) {
+                            currentEntry.company = text;
                         }
                     }
                 }
@@ -524,6 +599,9 @@ def _extract_experience(page):
 def _extract_education(page):
     """Extract all education entries by finding header text and using TreeWalker."""
     try:
+        # Scroll to education section and wait for load
+        _scroll_to_section(page, "Education")
+
         education = page.evaluate("""
             () => {
                 // Find section containing "Education" header
@@ -971,6 +1049,14 @@ def scrape_profile(profile_url: str, headless: bool = True, _is_retry: bool = Fa
                 _random_delay(1.5, 2.5)
                 page.evaluate("window.scrollTo(0, 0)")
                 _random_delay(1.0, 2.0)
+
+                # Scroll to bottom to load all lazy-loaded sections
+                _scroll_to_bottom(page)
+                _random_delay(1.0, 1.5)
+
+                # Click all "Show all" buttons to expand sections
+                _click_show_all_buttons(page)
+                _random_delay(0.5, 1.0)
 
                 # Session expired — try to auto-login and retry the scrape once
                 if _is_session_expired(page):
