@@ -1,4 +1,5 @@
 from playwright.sync_api import sync_playwright
+from dotenv import load_dotenv
 import json
 import time
 import random
@@ -7,13 +8,16 @@ import os
 import datetime
 import threading
 
+# Load .env file (LINKEDIN_EMAIL, LINKEDIN_PASSWORD)
+load_dotenv()
+
 # Use persistent volume on Fly.io, local directory otherwise
 if os.getenv("FLY_APP_NAME"):
     SESSION_FILE = "/data/linkedin_session.json"
 else:
     SESSION_FILE = os.path.join(os.path.dirname(__file__), "linkedin_session.json")
 
-# FIX #4: Cap concurrent browser instances to prevent OOM
+# Cap concurrent browser instances to prevent OOM
 # Raise or lower depending on your server's RAM (3 is safe for ~1–2GB)
 _SCRAPE_SEMAPHORE = threading.Semaphore(3)
 
@@ -46,7 +50,6 @@ def _scroll_to_bottom(page):
         if curr_height == prev_height:
             break
         prev_height = curr_height
-    # Scroll back to top for extraction
     page.evaluate("window.scrollTo(0, 0)")
     time.sleep(0.5)
 
@@ -62,6 +65,91 @@ def _click_see_more(page, selector):
         pass
 
 
+# ──────────────────────────────────────────────
+# Auto Login
+# ──────────────────────────────────────────────
+
+def auto_login() -> bool:
+    """
+    Automatically log in to LinkedIn using credentials from .env file.
+    Saves a fresh session to SESSION_FILE on success.
+
+    Returns True if login succeeded, False if LinkedIn blocked it
+    (e.g. CAPTCHA, email verification challenge).
+
+    Set in your .env file (or Fly.io secrets):
+        LINKEDIN_EMAIL=you@example.com
+        LINKEDIN_PASSWORD=yourpassword
+    """
+    email = os.getenv("LINKEDIN_EMAIL")
+    password = os.getenv("LINKEDIN_PASSWORD")
+
+    if not email or not password:
+        raise RuntimeError(
+            "LINKEDIN_EMAIL and LINKEDIN_PASSWORD must be set in your .env file "
+            "or as environment variables."
+        )
+
+    print("Auto-login: starting...")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
+        context = browser.new_context(user_agent=USER_AGENT, viewport=VIEWPORT)
+        try:
+            page = context.new_page()
+            page.set_default_timeout(30_000)
+
+            page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded")
+            _random_delay(1.5, 2.5)
+
+            # Fill in credentials
+            page.fill("#username", email)
+            _random_delay(0.5, 1.0)
+            page.fill("#password", password)
+            _random_delay(0.5, 1.0)
+            page.click('button[type="submit"]')
+
+            page.wait_for_load_state("load")
+            _random_delay(2.0, 3.5)
+
+            current_url = page.url.lower()
+
+            # LinkedIn is asking for CAPTCHA or email verification — can't automate this
+            if any(x in current_url for x in ["/checkpoint", "/challenge", "/verify"]):
+                print(
+                    "Auto-login blocked: LinkedIn is asking for manual verification.\n"
+                    "Run: python scraper.py --setup  to log in manually."
+                )
+                return False
+
+            # Wrong password or account issue
+            if any(x in current_url for x in ["/login", "/signup"]):
+                print(
+                    "Auto-login failed: still on login page.\n"
+                    "Check LINKEDIN_EMAIL and LINKEDIN_PASSWORD in your .env file."
+                )
+                return False
+
+            # Success — save session to file
+            if "/feed" in current_url or "linkedin.com" in current_url:
+                # Ensure the directory exists (for Fly.io /data volume)
+                os.makedirs(os.path.dirname(SESSION_FILE) or ".", exist_ok=True)
+                context.storage_state(path=SESSION_FILE)
+                print(f"Auto-login: session saved to {SESSION_FILE}")
+                return True
+
+            print(f"Auto-login: unexpected URL after login — {page.url}")
+            return False
+
+        finally:
+            context.close()
+            browser.close()
+
+
+# ──────────────────────────────────────────────
+# Extractors
+# ──────────────────────────────────────────────
+
 def _extract_basic_info(page):
     """Extract name, headline, location, profile picture, connections, followers."""
     data = {
@@ -73,12 +161,9 @@ def _extract_basic_info(page):
         "followers": 0
     }
 
-    # Scroll down and back up to trigger lazy loading
     _scroll_to_bottom(page)
     _random_delay(1.0, 2.0)
 
-    # Use JavaScript to extract directly from DOM
-    # LinkedIn now uses obfuscated CSS class names, so we use semantic/aria selectors
     js_data = page.evaluate("""
         () => {
             const result = {
@@ -88,21 +173,18 @@ def _extract_basic_info(page):
                 debug: {}
             };
 
-            // Find the main content area
             const main = document.querySelector('main');
             if (!main) {
                 result.debug.error = 'No main element found';
                 return result;
             }
 
-            // Get the first section in main (profile header)
             const profileSection = main.querySelector('section');
             if (!profileSection) {
                 result.debug.error = 'No section in main';
                 return result;
             }
 
-            // Get all text-containing elements in the profile section
             const allText = [];
             const walker = document.createTreeWalker(
                 profileSection,
@@ -122,8 +204,6 @@ def _extract_basic_info(page):
                 }
             }
 
-
-            // First substantial text is usually the name
             for (const item of allText) {
                 if (item.text.length > 2 && item.text.length < 60 &&
                     !item.text.includes('Skip') &&
@@ -133,7 +213,6 @@ def _extract_basic_info(page):
                 }
             }
 
-            // Find headline - look for text after name that describes the person
             let foundName = false;
             for (const item of allText) {
                 if (item.text === result.name) {
@@ -141,7 +220,6 @@ def _extract_basic_info(page):
                     continue;
                 }
                 if (foundName && item.text.length > 10 && item.text.length < 300) {
-                    // Skip common UI elements
                     if (!item.text.includes('Connect') &&
                         !item.text.includes('Message') &&
                         !item.text.includes('More') &&
@@ -152,7 +230,6 @@ def _extract_basic_info(page):
                 }
             }
 
-            // Find location - usually contains city/country
             for (const item of allText) {
                 const lower = item.text.toLowerCase();
                 if ((lower.includes('india') || lower.includes('united') ||
@@ -164,25 +241,21 @@ def _extract_basic_info(page):
                 }
             }
 
-            // Find connections and followers count separately
             result.connections = null;
             result.followers = 0;
 
             for (let i = 0; i < allText.length; i++) {
                 const text = allText[i].text.toLowerCase();
-                // Check for connections
                 if (text === 'connections' && !result.connections) {
                     if (i > 0) {
                         const prevText = allText[i-1].text;
-                        // Handle "500+" or pure numbers
                         if (/^\d+\+?$/.test(prevText)) {
-                            result.connections = prevText;  // Keep as string like "500+"
+                            result.connections = prevText;
                         } else if (/^[\d,]+$/.test(prevText)) {
                             result.connections = parseInt(prevText.replace(/,/g, ''));
                         }
                     }
                 }
-                // Check for followers
                 if (text === 'followers' && result.followers === 0) {
                     if (i > 0 && /^[\d,]+$/.test(allText[i-1].text)) {
                         result.followers = parseInt(allText[i-1].text.replace(/,/g, ''));
@@ -190,7 +263,6 @@ def _extract_basic_info(page):
                 }
             }
 
-            // Fallback: look for "500+ connections" or "X connections" in full text
             if (!result.connections) {
                 const fullText = document.body.innerText;
                 const connMatch = fullText.match(/(\d[\d,]*\+?)\s*connections?/i);
@@ -200,7 +272,6 @@ def _extract_basic_info(page):
                 }
             }
 
-            // Also look for "X followers" pattern in full text
             if (result.followers === 0) {
                 const fullText = document.body.innerText;
                 const followersMatch = fullText.match(/(\d[\d,]*)\s*followers?/i);
@@ -213,24 +284,18 @@ def _extract_basic_info(page):
         }
     """)
 
-
     data["name"] = js_data.get("name")
     data["headline"] = js_data.get("headline")
     data["location"] = js_data.get("location")
     data["connections"] = js_data.get("connections")
     data["followers"] = js_data.get("followers", 0)
 
-    # Extract profile picture using JS (LinkedIn uses obfuscated classes)
     try:
         src = page.evaluate("""
             () => {
-                // Find profile image in main section
                 const main = document.querySelector('main');
                 if (!main) return null;
 
-                // Look for profile photo (not banner)
-                // Profile photos have 'profile-displayphoto' in URL
-                // Banners have 'profile-background' or 'headerImage'
                 const imgs = main.querySelectorAll('img');
                 for (const img of imgs) {
                     const src = img.src || img.currentSrc;
@@ -245,7 +310,6 @@ def _extract_basic_info(page):
                     }
                 }
 
-                // Fallback: look for circular/square profile images by aspect ratio
                 for (const img of imgs) {
                     const src = img.src || img.currentSrc;
                     if (src && src.includes('licdn.com') &&
@@ -253,7 +317,7 @@ def _extract_basic_info(page):
                         !src.includes('banner') &&
                         !src.includes('ghost') &&
                         img.width > 50 && img.width < 500 &&
-                        Math.abs(img.width - img.height) < 50) {  // Square-ish = profile photo
+                        Math.abs(img.width - img.height) < 50) {
                         return src;
                     }
                 }
@@ -268,17 +332,14 @@ def _extract_basic_info(page):
 
 
 def _extract_about(page):
-    """Extract the About section by finding header text."""
+    """Extract the About section."""
     try:
         about_text = page.evaluate("""
             () => {
-                // Find section containing "About" header text
                 const sections = document.querySelectorAll('main section');
                 for (const section of sections) {
                     const text = section.innerText || '';
-                    // Check if this section starts with "About" as header
                     if (text.startsWith('About') || text.includes('\nAbout\n')) {
-                        // Get all text content, excluding the header
                         const allText = [];
                         const walker = document.createTreeWalker(
                             section,
@@ -316,11 +377,10 @@ def _extract_about(page):
 
 
 def _extract_experience(page):
-    """Extract all experience entries by finding header text and using TreeWalker."""
+    """Extract all experience entries."""
     try:
         experiences = page.evaluate("""
             () => {
-                // Find section containing "Experience" header
                 const sections = document.querySelectorAll('main section');
                 let expSection = null;
                 for (const section of sections) {
@@ -332,7 +392,6 @@ def _extract_experience(page):
                 }
                 if (!expSection) return [];
 
-                // Collect all text nodes from the experience section
                 const allText = [];
                 const walker = document.createTreeWalker(
                     expSection,
@@ -352,7 +411,6 @@ def _extract_experience(page):
                     }
                 }
 
-                // Parse text into experience entries
                 const results = [];
                 let currentEntry = null;
                 const seenEntries = new Set();
@@ -361,30 +419,25 @@ def _extract_experience(page):
                     const text = allText[i];
                     const nextText = allText[i + 1] || '';
 
-                    // Company pattern: contains · with employment type
                     const isCompany = text.includes('·') &&
                         (text.includes('Full-time') || text.includes('Part-time') ||
                          text.includes('Internship') || text.includes('Contract') ||
                          text.includes('Freelance') || text.includes('Self-employed'));
 
-                    // Duration pattern
                     const isDuration = /\d{4}/.test(text) &&
                         (text.includes(' - ') ||
                          text.toLowerCase().includes('present') ||
                          /\d+\s*(yr|mo|year|month)/i.test(text));
 
-                    // Location pattern
                     const isLocation = !isCompany && !isDuration &&
                         ((text.includes(',') && text.length < 60) ||
                          (text.toLowerCase().includes('remote') && text.length < 50) ||
                          (text.toLowerCase().includes('united states') && text.length < 80) ||
                          (text.toLowerCase().includes('india') && text.length < 50));
 
-                    // Skills pattern (skip)
                     const isSkills = text.toLowerCase().includes('skills') &&
                         (text.includes(':') || text.includes('+'));
 
-                    // Skip UI elements
                     if (text === '·' || text === '-' || text === '•' ||
                         /^\d+$/.test(text) || text.length < 2 || isSkills) {
                         continue;
@@ -405,23 +458,18 @@ def _extract_experience(page):
                         continue;
                     }
 
-                    // Description: long text
                     if (text.length > 80 && !isDuration && !isCompany && currentEntry) {
                         currentEntry.description = text;
                         continue;
                     }
 
-                    // Job title: short text not matching other patterns
-                    // Next item should be company (contains employment type indicator)
                     if (text.length > 2 && text.length < 80 &&
                         !isDuration && !isLocation && !isCompany) {
-                        // Check if next looks like company
                         const nextIsCompany = nextText.includes('·') &&
                             (nextText.includes('Full-time') || nextText.includes('Part-time') ||
                              nextText.includes('Internship') || nextText.includes('Contract'));
 
                         if (nextIsCompany) {
-                            // Save previous entry
                             if (currentEntry && currentEntry.title && currentEntry.company) {
                                 const key = currentEntry.title + '|' + currentEntry.company;
                                 if (!seenEntries.has(key)) {
@@ -441,7 +489,6 @@ def _extract_experience(page):
                     }
                 }
 
-                // Save last entry
                 if (currentEntry && currentEntry.title && currentEntry.company) {
                     const key = currentEntry.title + '|' + currentEntry.company;
                     if (!seenEntries.has(key)) {
@@ -458,11 +505,10 @@ def _extract_experience(page):
 
 
 def _extract_education(page):
-    """Extract all education entries by finding header text and using TreeWalker."""
+    """Extract all education entries."""
     try:
         education = page.evaluate("""
             () => {
-                // Find section containing "Education" header
                 const sections = document.querySelectorAll('main section');
                 let eduSection = null;
                 for (const section of sections) {
@@ -474,7 +520,6 @@ def _extract_education(page):
                 }
                 if (!eduSection) return [];
 
-                // Collect all text nodes from the education section
                 const allText = [];
                 const walker = document.createTreeWalker(
                     eduSection,
@@ -495,7 +540,6 @@ def _extract_education(page):
                     }
                 }
 
-                // Parse text into education entries
                 const results = [];
                 let currentEntry = null;
                 const seenSchools = new Set();
@@ -503,12 +547,10 @@ def _extract_education(page):
                 for (let i = 0; i < allText.length; i++) {
                     const text = allText[i];
 
-                    // Date pattern: contains year range
                     const isDate = /\d{4}\s*[-–]\s*\d{4}/.test(text) ||
                         /\d{4}\s*[-–]\s*(Present|present)/.test(text) ||
                         /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}/.test(text);
 
-                    // Skip short meaningless text
                     if (text.length < 2 || /^\d+$/.test(text)) continue;
 
                     if (isDate && currentEntry) {
@@ -516,7 +558,6 @@ def _extract_education(page):
                         continue;
                     }
 
-                    // Degree patterns - check FIRST before school
                     const looksLikeDegree = text.length > 3 && text.length < 150 &&
                         (text.includes('Bachelor') || text.includes('Master') ||
                          text.includes("Master's") || text.includes("Bachelor's") ||
@@ -526,7 +567,6 @@ def _extract_education(page):
                          text.includes('Ph.D') || text.includes('MBA') ||
                          text.includes('degree'));
 
-                    // School names - must contain institution keyword
                     const looksLikeSchool = text.length > 5 && text.length < 150 &&
                         !looksLikeDegree &&
                         (text.toLowerCase().includes('university') ||
@@ -536,7 +576,6 @@ def _extract_education(page):
                          text.toLowerCase().includes('academy'));
 
                     if (looksLikeSchool) {
-                        // Save previous entry if valid
                         if (currentEntry && currentEntry.school && !seenSchools.has(currentEntry.school)) {
                             seenSchools.add(currentEntry.school);
                             results.push(currentEntry);
@@ -553,7 +592,6 @@ def _extract_education(page):
                     }
                 }
 
-                // Save last entry
                 if (currentEntry && currentEntry.school && !seenSchools.has(currentEntry.school)) {
                     results.push(currentEntry);
                 }
@@ -567,7 +605,7 @@ def _extract_education(page):
 
 
 def _extract_skills(page, profile_url):
-    """Navigate to the skills detail page and extract all skills using TreeWalker."""
+    """Navigate to the skills detail page and extract all skills."""
     try:
         skills_url = profile_url.rstrip("/") + "/details/skills/"
         page.goto(skills_url, wait_until="domcontentloaded")
@@ -579,7 +617,6 @@ def _extract_skills(page, profile_url):
                 const results = [];
                 const seen = new Set();
 
-                // Section headers and UI elements to skip
                 const skipTexts = new Set([
                     'all', 'industry knowledge', 'tools & technologies',
                     'interpersonal skills', 'other skills', 'skills',
@@ -588,7 +625,6 @@ def _extract_skills(page, profile_url):
                     'add skill', 'take skill quiz', 'load more'
                 ]);
 
-                // Stop words - when we see these, stop collecting
                 const stopWords = [
                     'ad options', 'why am i seeing', 'more profiles for you',
                     'about', 'accessibility', 'talent solutions',
@@ -596,11 +632,9 @@ def _extract_skills(page, profile_url):
                     'linkedin corporation', 'help center'
                 ];
 
-                // Find the main content area
                 const main = document.querySelector('main');
                 if (!main) return [];
 
-                // Collect all text from the page
                 const allText = [];
                 const walker = document.createTreeWalker(
                     main,
@@ -617,24 +651,14 @@ def _extract_skills(page, profile_url):
                     }
                 }
 
-                // Filter to get skill names
                 for (const text of allText) {
                     const lower = text.toLowerCase();
 
-                    // Check if we hit a stop word - stop collecting
-                    if (stopWords.some(sw => lower.includes(sw))) {
-                        break;
-                    }
-
-                    // Skip if already seen or in skip list
+                    if (stopWords.some(sw => lower.includes(sw))) break;
                     if (seen.has(lower) || skipTexts.has(lower)) continue;
-
-                    // Skip numbers, very short text, or long text
                     if (text.length < 2 || text.length > 60) continue;
                     if (/^\d+$/.test(text)) continue;
                     if (/^\d+\s*(endorsement|connection|skill)/i.test(text)) continue;
-
-                    // Skip UI elements and company names in endorsements
                     if (text.includes('·') || text === '-') continue;
                     if (text.includes('Show') || text.includes('Add') ||
                         text.includes('Take') || text.includes('Quiz')) continue;
@@ -642,7 +666,6 @@ def _extract_skills(page, profile_url):
                     if (text.includes(' at ') || text.includes(' @ ')) continue;
                     if (text.includes('Connect')) continue;
 
-                    // Add as skill
                     results.push(text);
                     seen.add(lower);
                 }
@@ -656,7 +679,7 @@ def _extract_skills(page, profile_url):
 
 
 def _extract_certifications(page, profile_url):
-    """Navigate to the certifications detail page and extract entries using TreeWalker."""
+    """Navigate to the certifications detail page and extract entries."""
     try:
         certs_url = profile_url.rstrip("/") + "/details/certifications/"
         page.goto(certs_url, wait_until="domcontentloaded")
@@ -666,19 +689,15 @@ def _extract_certifications(page, profile_url):
         certs = page.evaluate("""
             () => {
                 const results = [];
-
-                // Find the main content area
                 const main = document.querySelector('main');
                 if (!main) return [];
 
-                // Skip texts
                 const skipTexts = new Set([
                     'certifications', 'licenses & certifications', 'show all',
                     'see more', 'see less', 'add certification', 'credential id',
                     'show credential', 'see credential', 'skills:'
                 ]);
 
-                // Stop words - when we see these, stop collecting
                 const stopWords = [
                     'ad options', 'why am i seeing', 'more profiles for you',
                     'about', 'accessibility', 'talent solutions',
@@ -686,7 +705,6 @@ def _extract_certifications(page, profile_url):
                     'linkedin corporation', 'help center', '· 3rd'
                 ];
 
-                // Collect all text from the page
                 const allText = [];
                 const walker = document.createTreeWalker(
                     main,
@@ -698,12 +716,9 @@ def _extract_certifications(page, profile_url):
                 let node;
                 while (node = walker.nextNode()) {
                     const text = node.textContent.trim();
-                    if (text.length > 0) {
-                        allText.push(text);
-                    }
+                    if (text.length > 0) allText.push(text);
                 }
 
-                // Parse certifications
                 let currentEntry = null;
                 const seenCerts = new Set();
 
@@ -711,21 +726,13 @@ def _extract_certifications(page, profile_url):
                     const text = allText[i];
                     const lower = text.toLowerCase();
 
-                    // Check if we hit a stop word - stop collecting
-                    if (stopWords.some(sw => lower.includes(sw))) {
-                        break;
-                    }
-
-                    // Skip UI elements
+                    if (stopWords.some(sw => lower.includes(sw))) break;
                     if (skipTexts.has(lower) || text.length < 2) continue;
                     if (text === '·' || text === '-' || /^\d+$/.test(text)) continue;
                     if (text.startsWith('Credential ID')) continue;
                     if (text.endsWith('.pdf')) continue;
 
-                    // Date pattern: "Issued Jan 2023"
                     const isDate = /^issued/i.test(text);
-
-                    // Known certification issuers (more specific)
                     const isIssuer = (lower.includes('coursera') || lower.includes('udemy') ||
                         lower.includes('linkedin learning') || lower.includes('google') ||
                         lower.includes('microsoft') || lower.includes('aws') ||
@@ -742,12 +749,9 @@ def _extract_certifications(page, profile_url):
                         continue;
                     }
 
-                    // Certification name - medium length, descriptive
                     if (text.length > 5 && text.length < 150 && !isDate && !isIssuer) {
-                        // Skip skill lists
                         if (lower.includes('machine learning,') || lower.includes('algorithms,')) continue;
 
-                        // If previous entry exists and has name, save it (deduplicated)
                         if (currentEntry && currentEntry.name) {
                             if (!seenCerts.has(currentEntry.name.toLowerCase())) {
                                 seenCerts.add(currentEntry.name.toLowerCase());
@@ -755,15 +759,10 @@ def _extract_certifications(page, profile_url):
                             }
                         }
 
-                        currentEntry = {
-                            name: text,
-                            issuing_org: null,
-                            date: null
-                        };
+                        currentEntry = { name: text, issuing_org: null, date: null };
                     }
                 }
 
-                // Save last entry
                 if (currentEntry && currentEntry.name) {
                     if (!seenCerts.has(currentEntry.name.toLowerCase())) {
                         results.push(currentEntry);
@@ -785,7 +784,6 @@ def _extract_recent_activity(page, profile_url):
         page.goto(activity_url, wait_until="domcontentloaded")
         _random_delay(2.0, 3.0)
 
-        # Scroll a bit to load some posts
         for _ in range(3):
             page.evaluate("window.scrollBy(0, 800)")
             time.sleep(random.uniform(0.5, 1.0))
@@ -796,7 +794,6 @@ def _extract_recent_activity(page, profile_url):
                 const main = document.querySelector('main');
                 if (!main) return [];
 
-                // Find all feed items (posts)
                 const feedItems = main.querySelectorAll('div[data-urn]');
                 const count = Math.min(feedItems.length, 5);
 
@@ -804,7 +801,6 @@ def _extract_recent_activity(page, profile_url):
                     const item = feedItems[i];
                     const post = { text: null, reactions: null, comments: null };
 
-                    // Get post text
                     const allText = [];
                     const walker = document.createTreeWalker(
                         item,
@@ -816,7 +812,6 @@ def _extract_recent_activity(page, profile_url):
                     let node;
                     while (node = walker.nextNode()) {
                         const text = node.textContent.trim();
-                        // Filter for actual post content
                         if (text.length > 30 && text.length < 3000 &&
                             !text.includes('Like') &&
                             !text.includes('Comment') &&
@@ -830,7 +825,6 @@ def _extract_recent_activity(page, profile_url):
                         post.text = allText.join(' ').substring(0, 1000);
                     }
 
-                    // Find reaction count (number followed by reaction indicators)
                     const allNums = item.querySelectorAll('span');
                     for (const span of allNums) {
                         const t = span.textContent.trim();
@@ -840,9 +834,7 @@ def _extract_recent_activity(page, profile_url):
                         }
                     }
 
-                    if (post.text) {
-                        results.push(post);
-                    }
+                    if (post.text) results.push(post);
                 }
 
                 return results;
@@ -853,74 +845,80 @@ def _extract_recent_activity(page, profile_url):
         return []
 
 
+def _is_session_expired(page) -> bool:
+    """Returns True if the current page indicates the session has expired."""
+    page_url = page.url.lower()
+    if any(x in page_url for x in ["/login", "/authwall", "/signup", "/checkpoint"]):
+        return True
+    try:
+        h1_text = page.locator("h1").first.inner_text(timeout=3000).strip().lower()
+        if h1_text in ("join linkedin", "sign in", "sign up"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 # ──────────────────────────────────────────────
 # Public API
 # ──────────────────────────────────────────────
 
 def setup_session():
     """
-    One-time setup: opens a browser for manual login.
-    FIX #2: Saves session as a small JSON file (cookies only) instead of
-    a full persistent browser profile directory. This avoids the file lock
-    that causes concurrent requests to fail, and stops disk space growing.
+    Manual fallback: opens a browser for manual login.
+    Use this if auto_login() fails due to CAPTCHA or verification challenges.
     """
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=False,
-            args=BROWSER_ARGS,
-        )
-        context = browser.new_context(
-            user_agent=USER_AGENT,
-            viewport=VIEWPORT,
-        )
+        browser = p.chromium.launch(headless=False, args=BROWSER_ARGS)
+        context = browser.new_context(user_agent=USER_AGENT, viewport=VIEWPORT)
         page = context.new_page()
         page.goto("https://www.linkedin.com/login")
 
         print("=" * 50)
         print("Log in to LinkedIn in the browser window.")
-        print("You can use 'Sign in with Google' or any method.")
         print("Press ENTER here after you have logged in.")
         print("=" * 50)
         input()
 
-        # Save ONLY cookies + localStorage as a small ~5KB JSON file.
-        # No bloated profile directory, no OS-level lock.
+        os.makedirs(os.path.dirname(SESSION_FILE) or ".", exist_ok=True)
         context.storage_state(path=SESSION_FILE)
         browser.close()
         print("Session saved to:", SESSION_FILE)
 
 
-def scrape_profile(profile_url: str, headless: bool = True) -> dict:
+def scrape_profile(profile_url: str, headless: bool = True, _is_retry: bool = False) -> dict:
     """
     Scrape a LinkedIn profile and return structured data.
+
+    - If no session exists, auto-logs in using LINKEDIN_EMAIL / LINKEDIN_PASSWORD from .env
+    - If session expires mid-scrape, auto-logs in again and retries once
+    - Falls back gracefully if LinkedIn blocks the auto-login (CAPTCHA etc.)
 
     Args:
         profile_url: Full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username)
         headless: Run browser in headless mode (default True)
 
     Returns:
-        Dict with keys: basic_info, about, experience, education, skills, certifications, recent_posts
+        Dict with keys: profile_url, basic_info, about, experience,
+                        education, skills, certifications, recent_posts, scraped_date
     """
-    # Normalize URL
     profile_url = profile_url.rstrip("/")
     if not profile_url.startswith("https://"):
         profile_url = "https://" + profile_url
 
+    # No session file — try to auto-login before doing anything else
     if not os.path.exists(SESSION_FILE):
-        raise RuntimeError(
-            f"No session file found at {SESSION_FILE}. "
-            "Run: python scraper.py --setup"
-        )
+        print("No session file found. Attempting auto-login...")
+        if not auto_login():
+            raise RuntimeError(
+                "Auto-login failed. LinkedIn may require manual verification.\n"
+                "Run: python scraper.py --setup"
+            )
 
     result = {"profile_url": profile_url}
 
-    # FIX #4: Acquire semaphore slot before launching browser.
-    # At most 3 browsers run simultaneously regardless of API concurrency.
     with _SCRAPE_SEMAPHORE:
         with sync_playwright() as p:
-            # FIX #2: Use launch() + storage_state instead of
-            # launch_persistent_context(). No folder lock — multiple
-            # requests can run truly in parallel.
             browser = p.chromium.launch(headless=headless, args=BROWSER_ARGS)
             context = None
             try:
@@ -930,40 +928,37 @@ def scrape_profile(profile_url: str, headless: bool = True) -> dict:
                     viewport=VIEWPORT,
                 )
                 page = context.new_page()
+                page.set_default_timeout(30_000)
 
-                # FIX: Hard cap — no single page action hangs forever
-                page.set_default_timeout(30_000)  # 30 seconds
-
-                # Navigate to profile
                 page.goto(profile_url, wait_until="domcontentloaded")
                 page.wait_for_load_state("load")
                 _random_delay(2.0, 3.5)
 
-                # Scroll to trigger lazy loading of content
                 page.evaluate("window.scrollTo(0, 500)")
                 _random_delay(1.5, 2.5)
                 page.evaluate("window.scrollTo(0, 0)")
                 _random_delay(1.0, 2.0)
 
-                # FIX #1: Only raise here — do NOT call browser.close() inside try.
-                # The finally block always handles cleanup, even on this path.
-                page_url = page.url.lower()
-                if any(x in page_url for x in ["/login", "/authwall", "/signup", "/checkpoint"]):
-                    raise RuntimeError(
-                        "SESSION_EXPIRED: Run python scraper.py --setup to refresh."
-                    )
-
-                # Double-check: if h1 says "Join LinkedIn" or "Sign in", we're on authwall
-                try:
-                    h1_text = page.locator("h1").first.inner_text(timeout=3000).strip()
-                    if h1_text.lower() in ("join linkedin", "sign in", "sign up"):
+                # Session expired — try to auto-login and retry the scrape once
+                if _is_session_expired(page):
+                    if _is_retry:
+                        # Already retried once — give up
                         raise RuntimeError(
-                            "SESSION_EXPIRED: Run python scraper.py --setup to refresh."
+                            "Session expired even after auto-login refresh.\n"
+                            "Run: python scraper.py --setup  to log in manually."
                         )
-                except RuntimeError:
-                    raise
-                except Exception:
-                    pass
+                    print("Session expired. Attempting auto-login and retry...")
+                    context.close()
+                    browser.close()
+                    context = None
+                    if auto_login():
+                        # Recurse once with _is_retry=True so we don't loop infinitely
+                        return scrape_profile(profile_url, headless, _is_retry=True)
+                    else:
+                        raise RuntimeError(
+                            "Session expired and auto-login failed.\n"
+                            "Run: python scraper.py --setup  to log in manually."
+                        )
 
                 print("Extracting basic info...")
                 result["basic_info"] = _extract_basic_info(page)
@@ -987,14 +982,9 @@ def scrape_profile(profile_url: str, headless: bool = True) -> dict:
                 print("Extracting recent posts...")
                 result["recent_posts"] = _extract_recent_activity(page, profile_url)
 
-                # FIX #3: datetime.now() called HERE, not at module import time.
-                # Previously `date` was set once when the process started,
-                # so every record got the same wrong timestamp.
                 result["scraped_date"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             finally:
-                # FIX #1: Always runs — cleans up even on session expiry,
-                # exceptions, or timeouts. No more zombie browser processes.
                 if context:
                     context.close()
                 browser.close()
@@ -1008,15 +998,19 @@ def scrape_profile(profile_url: str, headless: bool = True) -> dict:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LinkedIn Profile Scraper")
-    parser.add_argument("--setup", action="store_true", help="Set up browser session (manual login)")
+    parser.add_argument("--setup", action="store_true", help="Manual login fallback (opens browser)")
+    parser.add_argument("--login", action="store_true", help="Auto-login using .env credentials")
     parser.add_argument("--url", type=str, help="LinkedIn profile URL to scrape")
     parser.add_argument("--output", type=str, help="Save output to JSON file")
-    parser.add_argument("--visible", action="store_true", help="Run browser in visible (non-headless) mode")
+    parser.add_argument("--visible", action="store_true", help="Run browser in visible mode")
 
     args = parser.parse_args()
 
     if args.setup:
         setup_session()
+    elif args.login:
+        success = auto_login()
+        print("Login successful!" if success else "Login failed.")
     elif args.url:
         data = scrape_profile(args.url, headless=not args.visible)
         output = json.dumps(data, indent=2, ensure_ascii=False)
